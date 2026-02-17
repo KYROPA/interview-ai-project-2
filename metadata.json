@@ -1,0 +1,7 @@
+{
+  "name": "Copy of Gemini Ghost Hint",
+  "description": "A real-time voice-activated assistant that provides short text hints in a transparent overlay based on your microphone input.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}

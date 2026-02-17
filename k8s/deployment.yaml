@@ -1,0 +1,42 @@
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gemini-ghost-hint
+  labels:
+    app: ghost-hint
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ghost-hint
+  template:
+    metadata:
+      labels:
+        app: ghost-hint
+    spec:
+      containers:
+      - name: ghost-hint
+        image: ghost-hint:latest # Build this locally and load into kind
+        ports:
+        - containerPort: 80
+        resources:
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ghost-hint-service
+spec:
+  selector:
+    app: ghost-hint
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+  type: NodePort
