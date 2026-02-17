@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
-import { Settings, Mic, MicOff, Maximize, Minimize, Ghost, Trash2, Sparkles, BookOpen, AlertCircle } from 'lucide-react';
+import { Settings, Mic, MicOff, Maximize, Minimize, Ghost, Trash2, Sparkles, BookOpen, AlertCircle, Loader2 } from 'lucide-react';
 import { AppMode, Hint } from './types';
 import { DEFAULT_SYSTEM_INSTRUCTION, LIVE_MODEL } from './constants';
 import { createBlob } from './services/audioUtils';
@@ -14,15 +14,19 @@ const App: React.FC = () => {
   const [systemInstruction, setSystemInstruction] = useState(DEFAULT_SYSTEM_INSTRUCTION);
   const [lastTranscript, setLastTranscript] = useState('');
   const [volume, setVolume] = useState(0);
+  const [isConnecting, setIsConnecting] = useState(false);
 
+  const isActiveRef = useRef(false);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const sessionRef = useRef<any>(null);
   const streamingTextRef = useRef<string>('');
   const scrollRef = useRef<HTMLDivElement>(null);
   const retryCountRef = useRef(0);
   
-  // Константа порога чувствительности (VAD)
-  const VAD_THRESHOLD = 0.015; 
+  const VAD_THRESHOLD = 0.012; // Slightly lowered for better detection
 
   useEffect(() => {
     return () => {
@@ -33,7 +37,7 @@ const App: React.FC = () => {
   useEffect(() => {
     if (scrollRef.current) {
       const { scrollHeight, clientHeight, scrollTop } = scrollRef.current;
-      const isAtBottom = scrollHeight - clientHeight <= scrollTop + 100;
+      const isAtBottom = scrollHeight - clientHeight <= scrollTop + 150;
       if (isAtBottom) {
         scrollRef.current.scrollTo({ top: scrollHeight, behavior: 'smooth' });
       }
@@ -41,34 +45,55 @@ const App: React.FC = () => {
   }, [currentHint]);
 
   const startSession = async () => {
+    if (isActiveRef.current || isConnecting) return;
+    
     setIsError(null);
+    setIsConnecting(true);
+    
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const apiKey = process.env.API_KEY;
+      if (!apiKey) {
+        throw new Error('API Key is missing in environment.');
+      }
+
+      const ai = new GoogleGenAI({ apiKey });
       
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      streamRef.current = stream;
+
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      audioContextRef.current = audioCtx;
 
       const sessionPromise = ai.live.connect({
         model: LIVE_MODEL,
         config: {
           responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Puck' } }
+          },
           systemInstruction: systemInstruction,
           inputAudioTranscription: {},
           outputAudioTranscription: {},
         },
         callbacks: {
           onopen: () => {
-            console.log('Gemini Ghost observing...');
+            console.log('Gemini Ghost connection established.');
             setIsActive(true);
+            isActiveRef.current = true;
+            setIsConnecting(false);
             retryCountRef.current = 0;
-            const source = audioContextRef.current!.createMediaStreamSource(stream);
-            // Увеличиваем размер буфера до 8192 для снижения частоты отправки
-            const scriptProcessor = audioContextRef.current!.createScriptProcessor(8192, 1, 1);
+
+            const source = audioCtx.createMediaStreamSource(stream);
+            const scriptProcessor = audioCtx.createScriptProcessor(4096, 1, 1);
             
+            sourceRef.current = source;
+            processorRef.current = scriptProcessor;
+
             scriptProcessor.onaudioprocess = (e) => {
+              // Use Ref to check the latest state regardless of closure
+              if (!isActiveRef.current) return;
+
               const inputData = e.inputBuffer.getChannelData(0);
-              
-              // Простая проверка громкости (RMS) для фильтрации тишины
               let sum = 0;
               for (let i = 0; i < inputData.length; i++) {
                 sum += inputData[i] * inputData[i];
@@ -76,17 +101,24 @@ const App: React.FC = () => {
               const rms = Math.sqrt(sum / inputData.length);
               setVolume(rms);
 
-              // Отправляем аудио только если есть звук выше порога
               if (rms > VAD_THRESHOLD) {
                 const pcmBlob = createBlob(inputData);
                 sessionPromise.then((session) => {
-                  if (session) session.sendRealtimeInput({ media: pcmBlob });
+                  if (isActiveRef.current && session) {
+                    try {
+                      session.sendRealtimeInput({ media: pcmBlob });
+                    } catch (err) {
+                      console.warn('Realtime input delivery failed:', err);
+                    }
+                  }
+                }).catch(err => {
+                  console.error('Session promise rejected:', err);
                 });
               }
             };
 
             source.connect(scriptProcessor);
-            scriptProcessor.connect(audioContextRef.current!.destination);
+            scriptProcessor.connect(audioCtx.destination);
           },
           onmessage: async (message: LiveServerMessage) => {
             if (message.serverContent?.inputTranscription) {
@@ -114,51 +146,99 @@ const App: React.FC = () => {
             }
           },
           onerror: (e: any) => {
-            console.error('Gemini error:', e);
-            if (e?.message?.includes('429')) {
-              handleRetry();
+            console.error('Gemini Live Error:', e);
+            const errorMsg = e?.message || String(e);
+            
+            if (errorMsg.includes('429')) {
+              handleRetry('Quota exceeded (429).');
+            } else if (errorMsg.includes('403') || errorMsg.includes('401')) {
+              setIsError('Invalid API Key or Permissions.');
+              stopSession();
             } else {
-              setIsError('Произошла ошибка подключения. Проверьте ключ API.');
+              setIsError(`Connection error: ${errorMsg.slice(0, 50)}...`);
               stopSession();
             }
           },
-          onclose: () => {
-            setIsActive(false);
+          onclose: (e: CloseEvent) => {
+            console.log('Gemini Ghost session closed:', e.reason || 'No reason provided');
+            // If it closed unexpectedly (not by our stopSession)
+            if (isActiveRef.current) {
+               if (retryCountRef.current < 3) {
+                  handleRetry('Connection lost.');
+               } else {
+                  setIsError('Session terminated by server. Check your internet or API limits.');
+                  stopSession();
+               }
+            }
           }
         }
       });
 
       sessionRef.current = await sessionPromise;
-    } catch (err) {
-      console.error('Failed to start session:', err);
-      setIsError('Не удалось получить доступ к микрофону или API.');
+    } catch (err: any) {
+      console.error('Start session failed:', err);
+      setIsError(err.message || 'Microphone or API access denied.');
+      setIsConnecting(false);
+      stopSession();
     }
   };
 
-  const handleRetry = () => {
+  const handleRetry = (reason: string) => {
     stopSession();
-    const delay = Math.min(1000 * Math.pow(2, retryCountRef.current), 30000);
+    const delay = Math.min(1000 * Math.pow(2, retryCountRef.current), 15000);
     retryCountRef.current += 1;
-    setIsError(`Превышена квота (429). Повтор через ${Math.round(delay/1000)} сек...`);
+    setIsError(`${reason} Retrying in ${Math.round(delay/1000)}s...`);
     setTimeout(() => {
-      if (!isActive) startSession();
+      if (!isActiveRef.current && retryCountRef.current > 0) {
+        startSession();
+      }
     }, delay);
   };
 
   const stopSession = () => {
+    isActiveRef.current = false;
     setIsActive(false);
+    setIsConnecting(false);
+    
+    if (processorRef.current) {
+      try {
+        processorRef.current.disconnect();
+        processorRef.current.onaudioprocess = null;
+      } catch(e) {}
+      processorRef.current = null;
+    }
+    
+    if (sourceRef.current) {
+      try { sourceRef.current.disconnect(); } catch(e) {}
+      sourceRef.current = null;
+    }
+
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+
     if (audioContextRef.current) {
-      audioContextRef.current.close();
+      audioContextRef.current.close().catch(() => {});
       audioContextRef.current = null;
     }
-    sessionRef.current = null;
+
+    if (sessionRef.current) {
+      try { sessionRef.current.close(); } catch(e) {}
+      sessionRef.current = null;
+    }
+
     streamingTextRef.current = '';
     setVolume(0);
   };
 
   const toggleSession = () => {
-    if (isActive) stopSession();
-    else startSession();
+    if (isActive || isConnecting) {
+      retryCountRef.current = 0;
+      stopSession();
+    } else {
+      startSession();
+    }
   };
 
   return (
@@ -201,28 +281,31 @@ const App: React.FC = () => {
                   <Settings className="w-5 h-5 text-indigo-400" /> Session Control
                 </h2>
                 <button
+                  disabled={isConnecting}
                   onClick={toggleSession}
                   className={`w-full py-5 rounded-2xl font-bold flex items-center justify-center gap-3 transition-all ${
-                    isActive 
-                      ? 'bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20 shadow-lg shadow-red-500/5' 
-                      : 'bg-indigo-600 text-white hover:bg-indigo-500 shadow-xl shadow-indigo-600/20'
+                    isConnecting 
+                      ? 'bg-slate-700 text-slate-400 cursor-not-allowed'
+                      : isActive 
+                        ? 'bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20 shadow-lg shadow-red-500/5' 
+                        : 'bg-indigo-600 text-white hover:bg-indigo-500 shadow-xl shadow-indigo-600/20'
                   }`}
                 >
-                  {isActive ? <MicOff className="w-6 h-6 animate-pulse" /> : <Mic className="w-6 h-6" />}
-                  {isActive ? 'Cease Observation' : 'Initiate Listening'}
+                  {isConnecting ? <Loader2 className="w-6 h-6 animate-spin" /> : isActive ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
+                  {isConnecting ? 'Materializing...' : isActive ? 'Cease Observation' : 'Initiate Listening'}
                 </button>
                 
                 <div className="mt-8 pt-8 border-t border-slate-700/50">
                    <div className="flex items-center justify-between mb-2">
                     <span className="text-xs font-bold text-slate-500 uppercase tracking-widest">Mic Activity (VAD)</span>
                     <span className={`text-[10px] font-black uppercase ${volume > VAD_THRESHOLD ? 'text-emerald-400' : 'text-slate-600'}`}>
-                      {volume > VAD_THRESHOLD ? 'Transmitting' : 'Filtering Silenece'}
+                      {volume > VAD_THRESHOLD ? 'Transmitting' : 'Filtering Silence'}
                     </span>
                   </div>
                   <div className="w-full h-1.5 bg-slate-900 rounded-full overflow-hidden mb-4">
                     <div 
                       className={`h-full transition-all duration-100 ${volume > VAD_THRESHOLD ? 'bg-indigo-500' : 'bg-slate-700'}`} 
-                      style={{ width: `${Math.min(volume * 1000, 100)}%` }}
+                      style={{ width: `${Math.min(volume * 1200, 100)}%` }}
                     />
                   </div>
 
@@ -287,12 +370,14 @@ const App: React.FC = () => {
                     </button>
                  </div>
                  <div className="space-y-4 max-h-48 overflow-y-auto pr-2 custom-scrollbar">
-                    {hints.map((hint) => (
+                    {hints.length > 0 ? hints.map((hint) => (
                        <div key={hint.id} className="p-4 bg-slate-900/40 rounded-xl border border-slate-800/50 hover:border-indigo-500/30 transition-all cursor-pointer" onClick={() => setCurrentHint(hint.text)}>
                           <p className="text-sm text-slate-400 line-clamp-2">{hint.text}</p>
                           <p className="text-[9px] text-slate-600 mt-2 font-bold">{new Date(hint.timestamp).toLocaleTimeString()}</p>
                        </div>
-                    ))}
+                    )) : (
+                      <p className="text-xs text-slate-600 italic">History is empty...</p>
+                    )}
                  </div>
               </div>
             </div>
