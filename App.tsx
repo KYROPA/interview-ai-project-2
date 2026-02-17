@@ -1,7 +1,6 @@
-
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
-import { Settings, Mic, MicOff, Maximize, Minimize, Ghost, Trash2, Sparkles, BookOpen } from 'lucide-react';
+import { Settings, Mic, MicOff, Maximize, Minimize, Ghost, Trash2, Sparkles, BookOpen, AlertCircle } from 'lucide-react';
 import { AppMode, Hint } from './types';
 import { DEFAULT_SYSTEM_INSTRUCTION, LIVE_MODEL } from './constants';
 import { createBlob } from './services/audioUtils';
@@ -9,15 +8,21 @@ import { createBlob } from './services/audioUtils';
 const App: React.FC = () => {
   const [mode, setMode] = useState<AppMode>(AppMode.DASHBOARD);
   const [isActive, setIsActive] = useState(false);
+  const [isError, setIsError] = useState<string | null>(null);
   const [currentHint, setCurrentHint] = useState<string>('');
-  const [hints, setHints] = useState<Hint[]>([]); // Keep history for dashboard
+  const [hints, setHints] = useState<Hint[]>([]);
   const [systemInstruction, setSystemInstruction] = useState(DEFAULT_SYSTEM_INSTRUCTION);
   const [lastTranscript, setLastTranscript] = useState('');
+  const [volume, setVolume] = useState(0);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const sessionRef = useRef<any>(null);
   const streamingTextRef = useRef<string>('');
   const scrollRef = useRef<HTMLDivElement>(null);
+  const retryCountRef = useRef(0);
+  
+  // Константа порога чувствительности (VAD)
+  const VAD_THRESHOLD = 0.015; 
 
   useEffect(() => {
     return () => {
@@ -25,7 +30,6 @@ const App: React.FC = () => {
     };
   }, []);
 
-  // Auto-scroll to bottom when new text arrives, unless user has scrolled up
   useEffect(() => {
     if (scrollRef.current) {
       const { scrollHeight, clientHeight, scrollTop } = scrollRef.current;
@@ -37,6 +41,7 @@ const App: React.FC = () => {
   }, [currentHint]);
 
   const startSession = async () => {
+    setIsError(null);
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       
@@ -55,15 +60,29 @@ const App: React.FC = () => {
           onopen: () => {
             console.log('Gemini Ghost observing...');
             setIsActive(true);
+            retryCountRef.current = 0;
             const source = audioContextRef.current!.createMediaStreamSource(stream);
-            const scriptProcessor = audioContextRef.current!.createScriptProcessor(4096, 1, 1);
+            // Увеличиваем размер буфера до 8192 для снижения частоты отправки
+            const scriptProcessor = audioContextRef.current!.createScriptProcessor(8192, 1, 1);
             
             scriptProcessor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
-              const pcmBlob = createBlob(inputData);
-              sessionPromise.then((session) => {
-                session.sendRealtimeInput({ media: pcmBlob });
-              });
+              
+              // Простая проверка громкости (RMS) для фильтрации тишины
+              let sum = 0;
+              for (let i = 0; i < inputData.length; i++) {
+                sum += inputData[i] * inputData[i];
+              }
+              const rms = Math.sqrt(sum / inputData.length);
+              setVolume(rms);
+
+              // Отправляем аудио только если есть звук выше порога
+              if (rms > VAD_THRESHOLD) {
+                const pcmBlob = createBlob(inputData);
+                sessionPromise.then((session) => {
+                  if (session) session.sendRealtimeInput({ media: pcmBlob });
+                });
+              }
             };
 
             source.connect(scriptProcessor);
@@ -94,9 +113,14 @@ const App: React.FC = () => {
               streamingTextRef.current = '';
             }
           },
-          onerror: (e) => {
+          onerror: (e: any) => {
             console.error('Gemini error:', e);
-            stopSession();
+            if (e?.message?.includes('429')) {
+              handleRetry();
+            } else {
+              setIsError('Произошла ошибка подключения. Проверьте ключ API.');
+              stopSession();
+            }
           },
           onclose: () => {
             setIsActive(false);
@@ -107,8 +131,18 @@ const App: React.FC = () => {
       sessionRef.current = await sessionPromise;
     } catch (err) {
       console.error('Failed to start session:', err);
-      alert('Could not access microphone or connect to Gemini API.');
+      setIsError('Не удалось получить доступ к микрофону или API.');
     }
+  };
+
+  const handleRetry = () => {
+    stopSession();
+    const delay = Math.min(1000 * Math.pow(2, retryCountRef.current), 30000);
+    retryCountRef.current += 1;
+    setIsError(`Превышена квота (429). Повтор через ${Math.round(delay/1000)} сек...`);
+    setTimeout(() => {
+      if (!isActive) startSession();
+    }, delay);
   };
 
   const stopSession = () => {
@@ -119,6 +153,7 @@ const App: React.FC = () => {
     }
     sessionRef.current = null;
     streamingTextRef.current = '';
+    setVolume(0);
   };
 
   const toggleSession = () => {
@@ -152,12 +187,18 @@ const App: React.FC = () => {
             </button>
           </header>
 
+          {isError && (
+            <div className="bg-red-500/10 border border-red-500/20 p-4 rounded-2xl flex items-center gap-3 text-red-400 animate-in fade-in slide-in-from-top-2">
+              <AlertCircle className="w-5 h-5" />
+              <span className="text-sm font-medium">{isError}</span>
+            </div>
+          )}
+
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-            {/* Sidebar Controls */}
             <div className="lg:col-span-4 space-y-8">
               <div className="bg-slate-800/40 backdrop-blur-xl rounded-3xl p-6 border border-slate-700/50 shadow-2xl">
                 <h2 className="text-lg font-bold mb-6 flex items-center gap-2">
-                  <Settings className="w-5 h-5 text-indigo-400" /> Active Session
+                  <Settings className="w-5 h-5 text-indigo-400" /> Session Control
                 </h2>
                 <button
                   onClick={toggleSession}
@@ -172,12 +213,19 @@ const App: React.FC = () => {
                 </button>
                 
                 <div className="mt-8 pt-8 border-t border-slate-700/50">
-                   <div className="flex items-center justify-between mb-4">
-                    <span className="text-xs font-bold text-slate-500 uppercase tracking-widest">Pulse Status</span>
-                    <span className={`px-2 py-1 rounded-md text-[10px] font-black uppercase tracking-tighter ${isActive ? 'bg-emerald-500/10 text-emerald-400' : 'bg-slate-700 text-slate-500'}`}>
-                      {isActive ? 'Transmitting' : 'Idle'}
+                   <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-bold text-slate-500 uppercase tracking-widest">Mic Activity (VAD)</span>
+                    <span className={`text-[10px] font-black uppercase ${volume > VAD_THRESHOLD ? 'text-emerald-400' : 'text-slate-600'}`}>
+                      {volume > VAD_THRESHOLD ? 'Transmitting' : 'Filtering Silenece'}
                     </span>
                   </div>
+                  <div className="w-full h-1.5 bg-slate-900 rounded-full overflow-hidden mb-4">
+                    <div 
+                      className={`h-full transition-all duration-100 ${volume > VAD_THRESHOLD ? 'bg-indigo-500' : 'bg-slate-700'}`} 
+                      style={{ width: `${Math.min(volume * 1000, 100)}%` }}
+                    />
+                  </div>
+
                   {lastTranscript && (
                     <div className="p-4 bg-slate-900/50 rounded-2xl border border-slate-700/50">
                       <p className="text-[10px] text-indigo-400/70 uppercase font-black mb-2 tracking-widest flex items-center gap-2">
@@ -199,7 +247,6 @@ const App: React.FC = () => {
               </div>
             </div>
 
-            {/* Main Detailed View */}
             <div className="lg:col-span-8 flex flex-col gap-8">
               <div className="bg-slate-800/40 backdrop-blur-xl rounded-[2.5rem] p-8 border border-slate-700/50 shadow-2xl min-h-[500px] flex flex-col relative overflow-hidden group">
                 <div className="absolute top-0 right-0 p-8 opacity-5 group-hover:opacity-10 transition-opacity">
@@ -209,11 +256,8 @@ const App: React.FC = () => {
                 <div className="flex justify-between items-center mb-8 relative z-10">
                   <h2 className="text-xl font-black tracking-tight flex items-center gap-3">
                     <Sparkles className="w-5 h-5 text-indigo-400" /> 
-                    Detailed Intelligence
+                    Intelligence Output
                   </h2>
-                  <div className="flex items-center gap-2">
-                     <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mr-2">Scrollable View</span>
-                  </div>
                 </div>
 
                 <div 
@@ -229,13 +273,12 @@ const App: React.FC = () => {
                   ) : (
                     <div className="flex flex-col items-center justify-center text-center py-20 opacity-30 select-none h-full">
                       <Ghost className="w-20 h-20 mb-6 text-slate-500 animate-pulse" />
-                      <p className="text-xl font-bold tracking-tight text-slate-400">Silent Observation Active</p>
+                      <p className="text-xl font-bold tracking-tight text-slate-400">Ready to Observe</p>
                     </div>
                   )}
                 </div>
               </div>
 
-              {/* History Shelf */}
               <div className="bg-slate-800/20 rounded-3xl p-6 border border-slate-800 shadow-xl">
                  <div className="flex justify-between items-center mb-6">
                     <h3 className="text-sm font-bold text-slate-500 uppercase tracking-widest">Chronicle</h3>
@@ -244,7 +287,7 @@ const App: React.FC = () => {
                     </button>
                  </div>
                  <div className="space-y-4 max-h-48 overflow-y-auto pr-2 custom-scrollbar">
-                    {hints.map((hint, idx) => (
+                    {hints.map((hint) => (
                        <div key={hint.id} className="p-4 bg-slate-900/40 rounded-xl border border-slate-800/50 hover:border-indigo-500/30 transition-all cursor-pointer" onClick={() => setCurrentHint(hint.text)}>
                           <p className="text-sm text-slate-400 line-clamp-2">{hint.text}</p>
                           <p className="text-[9px] text-slate-600 mt-2 font-bold">{new Date(hint.timestamp).toLocaleTimeString()}</p>
@@ -257,7 +300,6 @@ const App: React.FC = () => {
         </div>
       )}
 
-      {/* Overlay View (Scrollable Detailed Window) */}
       {mode === AppMode.OVERLAY && (
         <div className="fixed inset-0 p-12 flex items-end justify-center pointer-events-none">
           <div className="w-full max-w-4xl pointer-events-auto flex flex-col gap-6 animate-in slide-in-from-bottom-8 duration-1000">
@@ -268,11 +310,6 @@ const App: React.FC = () => {
                 <span className="text-sm font-black text-white/90 uppercase tracking-widest">Spectral Intel</span>
               </div>
               <div className="flex items-center gap-6">
-                 {lastTranscript && (
-                    <div className="hidden md:block px-4 py-1.5 bg-white/5 rounded-full border border-white/5">
-                        <p className="text-[10px] text-white/40 italic font-medium truncate max-w-xs">Feed: {lastTranscript}</p>
-                    </div>
-                 )}
                 <button 
                   onClick={() => setMode(AppMode.DASHBOARD)}
                   className="p-2 rounded-xl text-white/40 hover:text-white hover:bg-white/10 transition-all"
@@ -283,15 +320,14 @@ const App: React.FC = () => {
             </div>
 
             <div className="relative group">
-               <div className="absolute -inset-1 bg-gradient-to-r from-indigo-500/20 to-purple-600/20 rounded-[2.5rem] blur opacity-50 group-hover:opacity-100 transition duration-1000"></div>
-               
+               <div className="absolute -inset-1 bg-gradient-to-r from-indigo-500/20 to-purple-600/20 rounded-[2.5rem] blur opacity-50"></div>
                <div 
                   ref={scrollRef}
                   className="relative bg-[#050505]/80 backdrop-blur-3xl border border-white/10 rounded-[2.5rem] p-10 shadow-3xl max-h-[60vh] min-h-[300px] overflow-y-auto custom-scrollbar flex items-start text-left"
                >
                   {currentHint ? (
                     <div className="w-full">
-                      <p className="text-3xl font-semibold text-white/95 leading-snug tracking-tight drop-shadow-sm selection:bg-indigo-500/40 whitespace-pre-wrap">
+                      <p className="text-3xl font-semibold text-white/95 leading-snug tracking-tight drop-shadow-sm whitespace-pre-wrap">
                         {currentHint}
                       </p>
                     </div>
@@ -302,10 +338,6 @@ const App: React.FC = () => {
                     </div>
                   )}
                </div>
-            </div>
-
-            <div className="text-center">
-                <p className="text-[10px] text-white/20 font-bold uppercase tracking-[0.5em] animate-pulse">Scroll to read more if needed</p>
             </div>
           </div>
         </div>
